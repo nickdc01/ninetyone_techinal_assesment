@@ -3,6 +3,9 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import yfinance as yf
+import plotly.io as pio
+pio.renderers.default = "notebook"   # or: "notebook_connected"
+
 
 PERCENT_COLS = ["Weight (%)","Active Weight (%)",
                 "%Contribution to Active Total Risk","%Contribution to Total Risk"]
@@ -28,25 +31,56 @@ ninetyone_colors = [
 
 def load_data(path: str, sheet_name=None) -> pd.DataFrame:
     path = str(path)
-    if path.lower().endswith(('.xls','.xlsx')):
+    if path.lower().endswith(('.xls', '.xlsx')):
         df = pd.read_excel(path, sheet_name=sheet_name)
     else:
         df = pd.read_csv(path)
+
+    # --- tidy columns & types ---
     df.columns = [c.strip() for c in df.columns]
     if "refdate" in df.columns:
         df["refdate"] = pd.to_datetime(df["refdate"], dayfirst=True, errors="coerce")
+
     for col in PERCENT_COLS:
         if col in df.columns:
-            s = (df[col].astype(str).str.replace('%','', regex=False)
-                           .str.replace(',','', regex=False).str.strip())
-            df[col] = pd.to_numeric(s, errors="coerce")/100.0
+            s = (df[col].astype(str).str.replace('%', '', regex=False)
+                               .str.replace(',', '', regex=False).str.strip())
+            df[col] = pd.to_numeric(s, errors="coerce") / 100.0
+
     for col in NUMERIC_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    for col in ["Asset Name","GICS_sector","Country Of Exposure"]:
+
+    for col in ["Asset Name", "GICS_sector", "Country Of Exposure"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
-    df = df.dropna(subset=["refdate","Asset Name"], how="any")
+
+    df = df.dropna(subset=["refdate", "Asset Name"], how="any")
+
+    # --- NEW: equity-only normalised weights ---
+    # treat empty strings as nulls for GICS
+    if "GICS_sector" in df.columns and "Weight (%)" in df.columns:
+        g = df["GICS_sector"].replace(["", " ", "nan", "None"], np.nan)
+        eq_mask = g.notna()
+
+        # 1) Net-normalised within equity sleeve (sums to 1 across equities each date)
+        eq_sum = df.loc[eq_mask].groupby("refdate")["Weight (%)"].transform("sum")
+        df["Weight (eq norm)"] = np.where(
+            eq_mask, df["Weight (%)"] / eq_sum, np.nan
+        )
+
+        # 2) Gross-normalised (leverage-neutral) within equity sleeve
+        eq_gross = df.loc[eq_mask].groupby("refdate")["Mkt Value"].transform(lambda x: x.abs().sum())
+        # fall back to weights if Mkt Value missing
+        if eq_gross.isna().all() and "Weight (%)" in df.columns:
+            eq_gross = df.loc[eq_mask].groupby("refdate")["Weight (%)"].transform(lambda x: x.abs().sum())
+            base = df["Weight (%)"].fillna(0)
+        else:
+            base = df["Mkt Value"].fillna(0)
+
+        gross_w = np.sign(base) * np.abs(base) / eq_gross
+        df["Weight (eq gross)"] = np.where(eq_mask, gross_w, np.nan)
+
     return df
 
 def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -92,17 +126,142 @@ def _latest_date(df: pd.DataFrame) -> pd.Timestamp:
     return pd.to_datetime(df["refdate"]).max()
 
 def top10_pie_latest(df: pd.DataFrame, by: str = "Weight (%)"):
-    if by not in df.columns: 
-        raise ValueError(f"{by} not in dataframe")
     dt = pd.to_datetime(df["refdate"]).max()
-    d = df[df["refdate"] == dt].sort_values(by, ascending=False).head(10).copy()
+    full = df[df["refdate"] == dt].copy()
+    d = full.sort_values(by, ascending=False).head(10).copy()
+
+    # Build colour map
     names = d["Asset Name"].tolist()
     cmap = {n: ninetyone_colors[i % len(ninetyone_colors)] for i, n in enumerate(names)}
-    fig = px.pie(d, names="Asset Name", values=by, color="Asset Name",
-                 color_discrete_map=cmap,
-                 title=f"Top 10 holdings by {by} — {dt.date()}")
-    fig.update_traces(sort=False, textposition="inside", textinfo="percent+label")
+
+    # customdata = true portfolio weight in %
+    # If your 'by' column is in fractions (0.0301), multiply by 100 for display
+    custom_weight_pct = (d[by] * 100).to_numpy()
+
+    fig = px.pie(
+        d, names="Asset Name", values=by, color="Asset Name",
+        color_discrete_map=cmap, title=f"Most Recent Top 10 holdings by {by}"
+    )
+
+    # Show percent of top-10 AND true portfolio weight
+    fig.update_traces(
+        sort=False,
+        textposition="inside",
+        textinfo="label",  # show label only
+        customdata=custom_weight_pct,
+        texttemplate="%{label}<br>%{customdata:.2f}%",  # show portfolio weight on the slice
+        hovertemplate="<b>%{label}</b><br>"
+                      "Portfolio weight: %{customdata:.2f}%<br>"
+    )
     fig.update_layout(legend_traceorder="normal")
+    return fig
+
+def sector_pie_latest(df, weight_col="Weight (%)", sector_col="GICS_sector", date_col="refdate"):
+    dt = pd.to_datetime(df[date_col]).max()
+    d = (df[df[date_col] == dt]
+         .dropna(subset=[sector_col])
+         .assign(w=lambda x: x[weight_col] * (100 if x[weight_col].max() <= 1 else 1))
+         .groupby(sector_col, as_index=False)['w'].sum())
+    d['pct'] = d['w'] / d['w'].sum() * 100
+    fig = px.pie(d, names=sector_col, values='pct',
+                 title=f"Most Recent GICS Sector Allocation — {dt:%Y-%m-%d}", color_discrete_sequence=ninetyone_colors)
+    return fig
+
+def country_pie_latest(df, weight_col="Weight (%)", country_col="Country Of Exposure",
+                       date_col="refdate", min_weight=0.001):
+    dt = pd.to_datetime(df[date_col]).max()
+    day = df[df[date_col] == dt].dropna(subset=[country_col]).copy()
+
+    g = (day.groupby(country_col, as_index=False)[weight_col]
+             .sum()
+             .rename(columns={weight_col: "w_raw"}))
+
+    g = g[g["w_raw"] > min_weight]
+    total = g["w_raw"].sum()
+    g["pct"] = np.where(total > 0, g["w_raw"] / total * 100.0, 0.0)
+
+    fig = px.pie(g, names=country_col, values="pct",
+                 title=f"Most Recent Country Allocation — {dt:%Y-%m-%d}", color_discrete_sequence=ninetyone_colors)
+    fig.update_traces(textinfo="label+percent")
+    return fig
+
+def _to_pct(s):
+    v = pd.to_numeric(pd.Series(s).astype(str).str.replace('%','', regex=False), errors='coerce')
+    if v.max() <= 1.0 + 1e-12:
+        v = v * 100.0
+    return v
+
+def risk_contrib_bar(df, value_col="%Contribution to Total Risk",
+                     name_col="Asset Name", date_col="refdate", top_n=10):
+    dt  = pd.to_datetime(df[date_col]).max()
+    day = df[df[date_col] == dt].copy()
+    day["ctr_pct"] = _to_pct(day[value_col])
+
+    d = (day.nlargest(top_n, "ctr_pct")
+            .sort_values("ctr_pct", ascending=True))
+
+    fig = px.bar(
+        d, x="ctr_pct", y=name_col, orientation="h",
+        title=f"Top {top_n} Contributors to Total Risk — {dt:%Y-%m-%d}",
+        color=name_col, color_discrete_sequence=ninetyone_colors
+    )
+    fig.update_traces(texttemplate="%{x:.1f}%", textposition="outside")
+    fig.update_layout(
+        showlegend=False,
+        xaxis_title="% Contribution to Total Risk",
+        yaxis_title=None,
+        margin=dict(l=80, r=30, t=60, b=40)
+    )
+    return fig
+
+def sector_risk_contrib(df, sector_col="GICS_sector",
+                        contrib_col="%Contribution to Total Risk",
+                        date_col="refdate"):
+    dt  = pd.to_datetime(df[date_col]).max()
+    day = df[df[date_col] == dt].dropna(subset=[sector_col]).copy()
+    day["ctr_pct"] = _to_pct(day[contrib_col])
+
+    d = (day.groupby(sector_col, as_index=False)["ctr_pct"]
+            .sum()
+            .sort_values("ctr_pct", ascending=True))
+
+    fig = px.bar(
+        d, x="ctr_pct", y=sector_col, orientation="h",
+        title=f"Sector Contribution to Total Risk — {dt:%Y-%m-%d}",
+        color=sector_col, color_discrete_sequence=ninetyone_colors
+    )
+    fig.update_traces(texttemplate="%{x:.1f}%", textposition="outside")
+    fig.update_layout(
+        showlegend=False,
+        xaxis_title="% Contribution to Total Risk",
+        yaxis_title=None,
+        margin=dict(l=80, r=30, t=60, b=40)
+    )
+    return fig
+
+def country_risk_contrib(df, country_col="Country Of Exposure",
+                         contrib_col="%Contribution to Total Risk",
+                         date_col="refdate"):
+    dt  = pd.to_datetime(df[date_col]).max()
+    day = df[df[date_col] == dt].dropna(subset=[country_col]).copy()
+    day["ctr_pct"] = _to_pct(day[contrib_col])
+
+    d = (day.groupby(country_col, as_index=False)["ctr_pct"]
+            .sum()
+            .sort_values("ctr_pct", ascending=True))
+
+    fig = px.bar(
+        d, x="ctr_pct", y=country_col, orientation="h",
+        title=f"Country Contribution to Total Risk — {dt:%Y-%m-%d}",
+        color=country_col, color_discrete_sequence=ninetyone_colors
+    )
+    fig.update_traces(texttemplate="%{x:.1f}%", textposition="outside")
+    fig.update_layout(
+        showlegend=False,
+        xaxis_title="% Contribution to Total Risk",
+        yaxis_title=None,
+        margin=dict(l=80, r=30, t=60, b=40)
+    )
     return fig
 
 def _robust_price_return(g, price_col="PRICE"):
@@ -113,26 +272,29 @@ def _robust_price_return(g, price_col="PRICE"):
     ret = ret.replace([np.inf, -np.inf], np.nan).clip(-0.5, 0.5)
     return ret
 
-def portfolio_vs_benchmarks(df):
-    d = df.sort_values(["Asset Name", "refdate"]).copy()
+def portfolio_vs_benchmarks(df, weight_col="Weight (eq norm)"):
+    d = (df[df["GICS_sector"].notna()][["refdate","Asset Name","PRICE","Weight (eq norm)"]]
+        .dropna(subset=["refdate","Asset Name","PRICE"])
+        .drop_duplicates(subset=["refdate","Asset Name"], keep="last")
+        .sort_values(["Asset Name","refdate"])
+        .copy())
 
-    # 1) normalise portfolio weights per date
-    d["w_norm"] = d["Weight (%)"]
-    s = d.groupby("refdate")["w_norm"].transform("sum")
-    d.loc[s > 0, "w_norm"] = d.loc[s > 0, "w_norm"] / s
+    # per-asset price returns (no cross-asset leakage)
+    d["ret_i"] = d.groupby("Asset Name")["PRICE"].pct_change()
+    d["ret_i"] = d["ret_i"].replace([np.inf, -np.inf], np.nan).clip(-0.5, 0.5)
 
-    # 2) robust PRICE returns
-    d["ret_i"] = d.groupby("Asset Name", group_keys=False).apply(_robust_price_return)
+    # lag equity-normalised weights
+    d["w_lag"] = d.groupby("Asset Name")["Weight (eq norm)"].shift(1)
 
-    # 3) lag weights and aggregate
-    d["w_lag"] = d.groupby("Asset Name")["w_norm"].shift(1).fillna(0)
-    port = (
-        d.assign(contrib=d["w_lag"] * d["ret_i"])
-         .groupby("refdate", as_index=False)["contrib"].sum()
-         .rename(columns={"contrib": "port_ret"})
-    )
+    # daily portfolio return = Σ w_{t-1,i} * r_{t,i}
+    port = ((d["w_lag"] * d["ret_i"])
+            .groupby(d["refdate"])
+            .sum(min_count=1)
+            .rename("port_ret")
+            .reset_index())
+
+    # TRI (base = 100)
     port["Portfolio TRI"] = 100 * (1 + port["port_ret"].fillna(0)).cumprod()
-    port = port[["refdate", "Portfolio TRI"]]
 
     # ---- Benchmarks (Yahoo) ----
     tickers = {"MSCI World":"URTH", "MSCI EM":"EEM", "SA All Share":"^J203.JO"}
@@ -161,39 +323,287 @@ def portfolio_vs_benchmarks(df):
     fig.update_layout(yaxis_title="TRI (base=100)", legend_title_text="")
     return fig, merged
 
-def compute_portfolio_benchmark_returns(df,
-                                        price_col="PRICE",
-                                        weight_col="Weight (%)",
-                                        active_col="Active Weight (%)",
-                                        id_col="Asset Name"):
-    d = df.sort_values([id_col, "refdate"]).copy()
+def compute_portfolio_benchmark_returns(
+    df,
+    price_col="PRICE",
+    weight_col="Weight (%)",          # or "Weight (eq norm)" if you prefer
+    active_col="Active Weight (%)",
+    id_col="Asset Name",
+    base=100.0,
+):
+    d = df.copy()
 
-    # normalise portfolio weights
-    d["w_norm"] = d[weight_col]
-    s = d.groupby("refdate")["w_norm"].transform("sum")
-    d.loc[s > 0, "w_norm"] = d.loc[s > 0, "w_norm"] / s
+    # 1) Equities only
+    if "GICS_sector" in d.columns:
+        d["GICS_sector"] = d["GICS_sector"].replace(["", " ", "nan", "None"], np.nan)
+        d = d[d["GICS_sector"].notna()].copy()
 
-    # reconstruct & normalise benchmark weights
+    # 2) Keep only needed cols, dedupe, sort
+    keep = ["refdate", id_col, price_col, weight_col, active_col]
+    d = (d[keep]
+           .dropna(subset=["refdate", id_col, price_col])
+           .drop_duplicates(subset=["refdate", id_col], keep="last")
+           .sort_values([id_col, "refdate"])
+           .copy())
+
+    # 3) Robust per-asset PRICE return
+    prev = d.groupby(id_col)[price_col].shift(1)
+    d["ret_i"] = ((d[price_col] - prev) / prev).where(prev > 0)
+    d["ret_i"] = d["ret_i"].replace([np.inf, -np.inf], np.nan).clip(-0.5, 0.5)
+
+    # 4) Derived benchmark weights (normalised within the equity set)
     d["b_norm"] = (d[weight_col] - d[active_col]).clip(lower=0)
     sb = d.groupby("refdate")["b_norm"].transform("sum")
-    d.loc[sb > 0, "b_norm"] = d.loc[sb > 0, "b_norm"] / sb
+    d.loc[sb.gt(0), "b_norm"] = d.loc[sb.gt(0), "b_norm"] / sb
 
-    # robust returns from PRICE
-    d["ret_i"] = d.groupby(id_col, group_keys=False).apply(
-        lambda g: _robust_price_return(g, price_col=price_col)
-    )
-
-    # lag weights
-    d["w_lag"] = d.groupby(id_col)["w_norm"].shift(1).fillna(0)
+    # 5) Lag weights
+    d["w_lag"] = d.groupby(id_col)[weight_col].shift(1).fillna(0)
     d["b_lag"] = d.groupby(id_col)["b_norm"].shift(1).fillna(0)
 
-    g = d.groupby("refdate", as_index=False)
-    port  = g.apply(lambda x: np.nansum(x["w_lag"] * x["ret_i"])).reset_index(name="port_ret")
-    bench = g.apply(lambda x: np.nansum(x["b_lag"] * x["ret_i"])).reset_index(name="bench_ret")
+    # 6) Build contribution columns and aggregate (no .apply)
+    d["port_contrib"]  = d["w_lag"] * d["ret_i"]
+    d["bench_contrib"] = d["b_lag"] * d["ret_i"]
 
-    out = port.merge(bench, on="refdate", how="inner")
-    out["active_ret"]    = out["port_ret"] - out["bench_ret"]
-    out["Portfolio TRI"] = 100 * (1 + out["port_ret"].fillna(0)).cumprod()
-    out["Benchmark TRI"] = 100 * (1 + out["bench_ret"].fillna(0)).cumprod()
-    out["Active TRI"]    = out["Portfolio TRI"] - out["Benchmark TRI"]
+    port  = (d.groupby("refdate", as_index=False)["port_contrib"]
+               .sum()
+               .rename(columns={"port_contrib": "port_ret"}))
+    bench = (d.groupby("refdate", as_index=False)["bench_contrib"]
+               .sum()
+               .rename(columns={"bench_contrib": "bench_ret"}))
+
+    out = port.merge(bench, on="refdate", how="inner").sort_values("refdate")
+    out["active_ret"]     = out["port_ret"] - out["bench_ret"]
+    out["Portfolio TRI"]  = base * (1 + out["port_ret"].fillna(0)).cumprod()
+    out["Benchmark TRI"]  = base * (1 + out["bench_ret"].fillna(0)).cumprod()
+    out["Active TRI"]     = out["Portfolio TRI"] - out["Benchmark TRI"]
     return out
+
+def monthly_bar_px_all(df, colors=[
+    "#0E6F63",
+    "#F4A78E"]):
+    import pandas as pd, plotly.express as px
+    out = compute_portfolio_benchmark_returns(df)
+    d = out.assign(refdate=pd.to_datetime(out['refdate'])).set_index('refdate')
+
+    # calendar-month returns over entire history
+    m = ((1 + d[['port_ret','bench_ret']]).groupby(pd.Grouper(freq='M')).prod() - 1).reset_index()
+    m['YearMonth'] = m['refdate'].dt.to_period('M').astype(str)
+
+    long = m.melt(id_vars='YearMonth', value_vars=['port_ret','bench_ret'],
+                  var_name='Series', value_name='Return')
+
+    fig = px.bar(long, x='YearMonth', y='Return', color='Series',
+                 barmode='group', labels={'YearMonth':'Month','Return':'Return'},
+                 title='Monthly Returns – Portfolio vs Benchmark',
+                 color_discrete_sequence=colors)
+    fig.update_yaxes(tickformat='.1%')
+    fig.update_traces(hovertemplate='%{y:.2%}')
+    fig.update_layout(legend_title='')
+    fig.update_xaxes(tickangle=-45)
+    return fig
+
+def plot_port_vs_bench(df):
+    df_compare = compute_portfolio_benchmark_returns(df)
+    fig = px.line(df_compare, x = 'refdate', y = ['Portfolio TRI', 'Benchmark TRI'], color_discrete_sequence=ninetyone_colors, title= 'Portfolio vs Benchmark price return index')
+    fig.show()
+
+def sector_exposure_area(df, weight_col="Weight (%)", sector_col="GICS_sector", date_col="refdate"):
+    d = df.copy()
+    d[date_col] = pd.to_datetime(d[date_col])
+    d = d.dropna(subset=[sector_col])
+    g = (d.groupby([date_col, sector_col], as_index=False)[weight_col]
+           .sum()
+           .sort_values(date_col))
+    fig = px.area(
+        g, x=date_col, y=weight_col, color=sector_col, groupnorm="fraction",
+        title="Sector Exposure Over Time (stacked 100%)",
+        color_discrete_sequence=ninetyone_colors
+    )
+    fig.update_yaxes(tickformat=".0%", title="Weight")
+    fig.update_layout(legend_title="Sector", margin=dict(l=40, r=20, t=60, b=40))
+    fig.update_traces(hovertemplate="%{x|%Y-%m-%d}<br>%{fullData.name}: %{y:.1%}<extra></extra>")
+    return fig
+
+def country_exposure_area(df, weight_col="Weight (%)", country_col="Country Of Exposure", date_col="refdate"):
+    d = df.copy()
+    d[date_col] = pd.to_datetime(d[date_col])
+    d = d.dropna(subset=[country_col])
+    g = (d.groupby([date_col, country_col], as_index=False)[weight_col]
+           .sum()
+           .sort_values(date_col))
+    fig = px.area(
+        g, x=date_col, y=weight_col, color=country_col, groupnorm="fraction",
+        title="Country Exposure Over Time (stacked 100%)",
+    color_discrete_sequence=ninetyone_colors)
+    fig.update_yaxes(tickformat=".0%", title="Weight")
+    fig.update_layout(legend_title="Country", margin=dict(l=40, r=20, t=60, b=40))
+    fig.update_traces(hovertemplate="%{x|%Y-%m-%d}<br>%{fullData.name}: %{y:.1%}<extra></extra>")
+    return fig
+
+def _attrib_area(df, group_col, weight_col="Weight (eq norm)",
+                 id_col="Asset Name", date_col="refdate", title="Return attribution"):
+    # keep only what we need & clean
+    d = (df[df[group_col].notna()][[date_col, id_col, group_col, "PRICE", weight_col]]
+           .dropna(subset=[date_col, id_col, "PRICE"])
+           .drop_duplicates(subset=[date_col, id_col], keep="last")
+           .sort_values([id_col, date_col])
+           .copy())
+
+    # per-asset simple return
+    d["ret_i"] = d.groupby(id_col)["PRICE"].pct_change()
+    d["ret_i"] = d["ret_i"].replace([np.inf, -np.inf], np.nan).clip(-0.5, 0.5)
+
+    # beginning-of-period weights (already clean & in fraction for eq-norm)
+    d["w_lag"] = d.groupby(id_col)[weight_col].shift(1)
+
+    # period contribution = sum_i w_{t-1,i} * r_{t,i} per group
+    g = ((d["w_lag"] * d["ret_i"])
+         .groupby([d[date_col], d[group_col]])
+         .sum(min_count=1)
+         .rename("contrib")
+         .reset_index()
+         .sort_values(date_col))
+
+    # cumulative contribution by group (for stacked area)
+    g["cum_contrib"] = g.groupby(group_col)["contrib"].cumsum()
+
+    fig = px.area(
+        g, x=date_col, y="cum_contrib", color=group_col,
+        title=title, color_discrete_sequence=ninetyone_colors
+    )
+    fig.update_yaxes(tickformat=".2%")
+    fig.update_traces(hovertemplate="%{x|%Y-%m-%d}<br>%{fullData.name}: %{y:.2%}<extra></extra>")
+    fig.update_layout(legend_title=group_col, margin=dict(l=40, r=20, t=60, b=40))
+    return fig
+
+# Wrappers
+def sector_return_contrib_area(df, **kw):
+    return _attrib_area(df, group_col="GICS_sector",
+                        title="Cumulative Return Attribution by Sector", **kw)
+
+def country_return_contrib_area(df, **kw):
+    return _attrib_area(df, group_col="Country Of Exposure",
+                        title="Cumulative Return Attribution by Country", **kw)
+
+def _attrib_totals_bar(df, group_col, weight_col="Weight (eq norm)",
+                       id_col="Asset Name", date_col="refdate",
+                       title="Total Return Attribution"):
+    # Clean + prep (same pattern you used)
+    d = (df[df[group_col].notna()][[date_col, id_col, group_col, "PRICE", weight_col]]
+           .dropna(subset=[date_col, id_col, "PRICE"])
+           .drop_duplicates(subset=[date_col, id_col], keep="last")
+           .sort_values([id_col, date_col])
+           .copy())
+
+    # Per-asset return and lagged weights
+    d["ret_i"] = d.groupby(id_col)["PRICE"].pct_change().replace([np.inf, -np.inf], np.nan).clip(-0.5, 0.5)
+    d["w_lag"] = d.groupby(id_col)[weight_col].shift(1)
+
+    # Daily group contribution
+    g = ((d["w_lag"] * d["ret_i"])
+         .groupby([d[date_col], d[group_col]])
+         .sum(min_count=1)
+         .rename("contrib")
+         .reset_index())
+
+    if g.empty:
+        raise ValueError("No contribution rows to plot (check inputs).")
+
+    # Cumulative to most recent date
+    g = g.sort_values(date_col)
+    g["cum_contrib"] = g.groupby(group_col)["contrib"].cumsum()
+    last_dt = g[date_col].max()
+    t = (g[g[date_col] == last_dt][[group_col, "cum_contrib"]]
+         .sort_values("cum_contrib", ascending=True))
+    t = t[t['cum_contrib'].abs() > 0.001]
+
+    # Bar chart
+    fig = px.bar(
+        t, x="cum_contrib", y=group_col, orientation="h",
+        title=f"{title} — through {pd.to_datetime(last_dt):%Y-%m-%d}",
+        color=group_col, color_discrete_sequence=ninetyone_colors
+    )
+    fig.update_traces(texttemplate="%{x:.2%}", textposition="outside")
+    fig.update_layout(
+        showlegend=False,
+        xaxis_title="Cumulative Contribution",
+        yaxis_title=None,
+        margin=dict(l=100, r=30, t=60, b=40)
+    )
+    fig.update_xaxes(tickformat=".1%")
+    return fig
+
+# Wrappers
+def sector_return_contrib_totals_bar(df, **kw):
+    return _attrib_totals_bar(
+        df, group_col="GICS_sector",
+        title="Total Return Attribution by Sector", **kw
+    )
+
+def country_return_contrib_totals_bar(df, **kw):
+    return _attrib_totals_bar(
+        df, group_col="Country Of Exposure",
+        title="Total Return Attribution by Country", **kw
+    )
+
+def _asset_cum_contrib(df, weight_col="Weight (eq norm)",
+                       id_col="Asset Name", date_col="refdate"):
+    # minimal prep: keep what's needed, dedupe per date-asset, sort
+    d = (df[[date_col, id_col, "PRICE", weight_col]]
+           .dropna(subset=[date_col, id_col, "PRICE"])
+           .drop_duplicates(subset=[date_col, id_col], keep="last")
+           .sort_values([id_col, date_col])
+           .copy())
+
+    # per-asset returns and lagged weights
+    d["ret_i"] = d.groupby(id_col)["PRICE"].pct_change()
+    d["ret_i"] = d["ret_i"].replace([np.inf, -np.inf], np.nan).clip(-0.5, 0.5)
+    d["w_lag"] = d.groupby(id_col)[weight_col].shift(1)
+
+    # daily contrib per asset, then cumulative to last date
+    g = ((d["w_lag"] * d["ret_i"])
+         .groupby([d[date_col], d[id_col]])
+         .sum(min_count=1)
+         .rename("contrib")
+         .reset_index()
+         .sort_values(date_col))
+
+    g["cum_contrib"] = g.groupby(id_col)["contrib"].cumsum()
+    last_dt = g[date_col].max()
+    t = (g[g[date_col] == last_dt][[id_col, "cum_contrib"]]
+           .dropna()
+           .copy())
+    return t, last_dt
+
+def top_share_contributors_bar(df, top_n=10, weight_col="Weight (eq norm)",
+                               id_col="Asset Name", date_col="refdate"):
+    t, last_dt = _asset_cum_contrib(df, weight_col, id_col, date_col)
+    top = (t.nlargest(top_n, "cum_contrib")
+             .sort_values("cum_contrib", ascending=True))
+    fig = px.bar(
+        top, x="cum_contrib", y=id_col, orientation="h",
+        title=f"Top {top_n} Share Contributors — through {pd.to_datetime(last_dt):%Y-%m-%d}",
+        color=id_col, color_discrete_sequence=ninetyone_colors
+    )
+    fig.update_traces(texttemplate="%{x:.2%}", textposition="outside")
+    fig.update_layout(showlegend=False, xaxis_title="Cumulative Contribution", yaxis_title=None,
+                      margin=dict(l=120, r=30, t=60, b=40))
+    fig.update_xaxes(tickformat=".1%")
+    return fig
+
+def top_share_detractors_bar(df, top_n=10, weight_col="Weight (eq norm)",
+                             id_col="Asset Name", date_col="refdate"):
+    t, last_dt = _asset_cum_contrib(df, weight_col, id_col, date_col)
+    det = (t.nsmallest(top_n, "cum_contrib")
+             .sort_values("cum_contrib", ascending=True))
+    fig = px.bar(
+        det, x="cum_contrib", y=id_col, orientation="h",
+        title=f"Top {top_n} Share Detractors — through {pd.to_datetime(last_dt):%Y-%m-%d}",
+        color=id_col, color_discrete_sequence=ninetyone_colors
+    )
+    fig.update_traces(texttemplate="%{x:.2%}", textposition="outside")
+    fig.update_layout(showlegend=False, xaxis_title="Cumulative Contribution", yaxis_title=None,
+                      margin=dict(l=120, r=30, t=60, b=40))
+    fig.update_xaxes(tickformat=".1%")
+    return fig
+
