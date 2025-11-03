@@ -185,17 +185,11 @@ def country_pie_latest(df, weight_col="Weight (%)", country_col="Country Of Expo
     fig.update_traces(textinfo="label+percent")
     return fig
 
-def _to_pct(s):
-    v = pd.to_numeric(pd.Series(s).astype(str).str.replace('%','', regex=False), errors='coerce')
-    if v.max() <= 1.0 + 1e-12:
-        v = v * 100.0
-    return v
-
 def risk_contrib_bar(df, value_col="%Contribution to Total Risk",
                      name_col="Asset Name", date_col="refdate", top_n=10):
     dt  = pd.to_datetime(df[date_col]).max()
     day = df[df[date_col] == dt].copy()
-    day["ctr_pct"] = _to_pct(day[value_col])
+    day["ctr_pct"] = day[value_col] *100
 
     d = (day.nlargest(top_n, "ctr_pct")
             .sort_values("ctr_pct", ascending=True))
@@ -219,7 +213,7 @@ def sector_risk_contrib(df, sector_col="GICS_sector",
                         date_col="refdate"):
     dt  = pd.to_datetime(df[date_col]).max()
     day = df[df[date_col] == dt].dropna(subset=[sector_col]).copy()
-    day["ctr_pct"] = _to_pct(day[contrib_col])
+    day["ctr_pct"] = day[contrib_col]*100
 
     d = (day.groupby(sector_col, as_index=False)["ctr_pct"]
             .sum()
@@ -244,7 +238,7 @@ def country_risk_contrib(df, country_col="Country Of Exposure",
                          date_col="refdate"):
     dt  = pd.to_datetime(df[date_col]).max()
     day = df[df[date_col] == dt].dropna(subset=[country_col]).copy()
-    day["ctr_pct"] = _to_pct(day[contrib_col])
+    day["ctr_pct"] = day[contrib_col] * 100
 
     d = (day.groupby(country_col, as_index=False)["ctr_pct"]
             .sum()
@@ -607,3 +601,207 @@ def top_share_detractors_bar(df, top_n=10, weight_col="Weight (eq norm)",
     fig.update_xaxes(tickformat=".1%")
     return fig
 
+def portfolio_risk_stats(df):
+    import numpy as np, pandas as pd
+    out = compute_portfolio_benchmark_returns(df).dropna(subset=['port_ret','bench_ret']).copy()
+
+    port, bench = out['port_ret'], out['bench_ret']
+    active = port - bench
+    ann = 252  # trading days per year
+
+    def ann_ret(x): return (1 + x.mean())**ann - 1
+    def ann_vol(x): return x.std(ddof=0) * np.sqrt(ann)
+
+    # cumulative series for drawdowns
+    port_tr = (1 + port).cumprod()
+    bench_tr = (1 + bench).cumprod()
+    dd = (port_tr / port_tr.cummax() - 1).min()
+
+    stats = {
+        'Ann. Return (Portfolio)': ann_ret(port),
+        'Ann. Return (Benchmark)': ann_ret(bench),
+        'Active Return (Ann.)'   : ann_ret(port) - ann_ret(bench),
+        'Volatility (Ann.)'      : ann_vol(port),
+        'Tracking Error (Ann.)'  : ann_vol(active),
+        'Sharpe Ratio'           : port.mean()/port.std(ddof=0)*np.sqrt(ann),
+        'Information Ratio'      : active.mean()/active.std(ddof=0)*np.sqrt(ann),
+        'Max Drawdown'           : dd,
+    }
+    return pd.DataFrame(stats, index=['Value']).T
+
+def drawdown_px(df):
+    import pandas as pd, plotly.express as px
+    out = compute_portfolio_benchmark_returns(df).sort_values('refdate')
+    v = (1 + out['port_ret']).cumprod()
+    dd = v / v.cummax() - 1
+    m = pd.DataFrame({'refdate': pd.to_datetime(out['refdate']), 'drawdown': dd})
+    fig = px.area(m, x='refdate', y='drawdown', title='Portfolio Drawdown', color_discrete_sequence=ninetyone_colors)
+    fig.update_yaxes(tickformat='.0%', range=[dd.min()*1.05, 0])
+    fig.update_traces(hovertemplate='%{y:.2%}')
+    return fig
+
+def beta_avg_series_px(df):
+    import pandas as pd, numpy as np, plotly.express as px
+    d = df.copy()
+    d['refdate'] = pd.to_datetime(d['refdate'], dayfirst=True, errors='coerce')
+    d['w'] = pd.to_numeric(d['Weight (%)'].astype(str).str.rstrip('%'), errors='coerce')/100.0
+    d['beta'] = pd.to_numeric(d['Beta (Bmk)'], errors='coerce')
+    s = d.dropna(subset=['refdate','w','beta']).groupby('refdate').apply(
+        lambda x: (x['w']*x['beta']).sum() / x['w'].sum()
+    ).reset_index(name='weighted_beta')
+    fig = px.line(s, x='refdate', y='weighted_beta', title='Weighted Average Portfolio Beta', color_discrete_sequence=ninetyone_colors)
+    fig.add_hline(y=1.0, line_dash='dash', annotation_text='Benchmark = 1.0', annotation_position='top left')
+    fig.update_yaxes(title='Beta')
+    fig.update_xaxes(title='')
+    return fig
+
+def sector_beta_bar_px(df, refdate=None):
+    import pandas as pd, numpy as np, plotly.express as px
+    d = df.copy()
+    d['refdate'] = pd.to_datetime(d['refdate'], dayfirst=True, errors='coerce')
+    d['w'] = pd.to_numeric(d['Weight (%)'].astype(str).str.rstrip('%'), errors='coerce')/100.0
+    d['beta'] = pd.to_numeric(d['Beta (Bmk)'], errors='coerce')
+    snap = d.loc[d['refdate'] == (pd.to_datetime(refdate) if refdate else d['refdate'].max())]
+    g = (snap.dropna(subset=['GICS_sector','w','beta'])
+              .groupby('GICS_sector')
+              .apply(lambda x: (x['w']*x['beta']).sum()/x['w'].sum())
+              .reset_index(name='sector_beta')
+              .sort_values('sector_beta', ascending=False))
+    fig = px.bar(g, x='GICS_sector', y='sector_beta', title='Sector Weighted-Average Beta (most recent)',
+                 labels={'GICS_sector':'Sector','sector_beta':'Beta'}, color_discrete_sequence=ninetyone_colors)
+    fig.add_hline(y=1.0, line_dash='dash', annotation_text='Benchmark = 1.0', annotation_position='top left')
+    fig.update_layout(xaxis_tickangle=-30)
+    return fig
+
+def _to_pct(series):
+    import pandas as pd
+    return pd.to_numeric(series.astype(str).str.rstrip('%'), errors='coerce') / 100.0
+
+def risk_contrib_area(df,
+                      group_col="GICS_sector",
+                      contrib_col="%Contribution to Total Risk",
+                      date_col="refdate",
+                      colors=None,
+                      title_prefix="Total Risk Decomposition"):
+    import pandas as pd, numpy as np, plotly.express as px
+
+    d = df.copy()
+    d[date_col] = pd.to_datetime(d[date_col], dayfirst=True, errors="coerce")
+
+    # Clean and convert
+    d[group_col] = d[group_col].astype(str).str.strip()
+    d.loc[d[group_col].isin(["", "nan", "None", "NaN"]), group_col] = np.nan
+    d = d.dropna(subset=[date_col, group_col])
+    d["pct"] = pd.to_numeric(d[contrib_col].astype(str).str.rstrip('%'), errors="coerce")
+
+    g = (d.dropna(subset=["pct"])
+           .groupby([date_col, group_col], as_index=False)["pct"].sum()
+           .sort_values([date_col, "pct"], ascending=[True, False]))
+
+    # Area chart
+    fig = px.area(
+        g, x=date_col, y="pct", color=group_col,
+        title=f"{title_prefix} by {group_col}",
+        labels={date_col:"", "pct":"% Contribution to Total Risk", group_col:group_col},
+        color_discrete_sequence=colors
+    )
+    fig.update_yaxes(tickformat=".2%")
+    fig.update_traces(hovertemplate="%{y:.2%}<br>%{fullData.name}")
+    fig.update_layout(legend_title=group_col, margin=dict(l=40, r=20, t=60, b=40))
+    return fig
+
+# Convenience wrappers
+def sector_risk_contrib_area(df, **kw):
+    return risk_contrib_area(df, group_col="GICS_sector", **kw)
+
+def country_risk_contrib_area(df, **kw):
+    return risk_contrib_area(df, group_col="Country Of Exposure", **kw)
+
+
+def risk_contrib_active_line(df,
+                      group_col="GICS_sector",
+                      contrib_col="%Contribution to Active Total Risk",
+                      date_col="refdate",
+                      colors=None,
+                      title_prefix="Total Active Risk Decomposition"):
+    import pandas as pd, numpy as np, plotly.express as px
+
+    d = df.copy()
+    d[date_col] = pd.to_datetime(d[date_col], dayfirst=True, errors="coerce")
+
+    # Clean and convert
+    d[group_col] = d[group_col].astype(str).str.strip()
+    d.loc[d[group_col].isin(["", "nan", "None", "NaN"]), group_col] = np.nan
+    d = d.dropna(subset=[date_col, group_col])
+    d["pct"] = pd.to_numeric(d[contrib_col].astype(str).str.rstrip('%'), errors="coerce")
+
+    g = (d.dropna(subset=["pct"])
+           .groupby([date_col, group_col], as_index=False)["pct"].sum()
+           .sort_values([date_col, "pct"], ascending=[True, False]))
+
+    # Area chart
+    fig = px.area(
+        g, x=date_col, y="pct", color=group_col,
+        title=f"{title_prefix} by {group_col}",
+        labels={date_col:"", "pct":"% Contribution to Active Total Risk", group_col:group_col},
+        color_discrete_sequence=colors
+    )
+    fig.update_yaxes(tickformat=".2%")
+    fig.update_traces(hovertemplate="%{y:.2%}<br>%{fullData.name}")
+    fig.update_layout(legend_title=group_col, margin=dict(l=40, r=20, t=60, b=40))
+    return fig
+
+# Convenience wrappers
+def sector_risk_act_contrib_area(df, **kw):
+    return risk_contrib_active_line(df, group_col="GICS_sector", **kw)
+
+def country_risk_act_contrib_area(df, **kw):
+    return risk_contrib_active_line(df, group_col="Country Of Exposure", **kw)
+
+def _prep(df):
+    df = df.copy()
+    df["refdate"] = pd.to_datetime(df["refdate"], dayfirst=True)
+    w = pd.to_numeric(df["Weight (%)"].astype(str).str.replace("%","", regex=False), errors="coerce")
+    df["w"] = np.where(w > 1, w/100.0, w)
+    return df
+
+def _wavg(g, col):
+    g = g.dropna(subset=[col, "w"])
+    if g.empty:
+        return np.nan
+    w = g["w"].to_numpy()
+    a = g[col].to_numpy()
+    wsum = np.nansum(w)
+    if not np.isfinite(wsum) or wsum == 0:
+        return np.nan               # <- key fix: skip groups with zero total weight
+    return np.average(a, weights=w)
+
+# 1) Portfolio total ESG through time
+def fig_portfolio_esg(df, col="Overall ESG Score"):
+    df = _prep(df)
+    d = (df.groupby("refdate")
+           .apply(lambda g: _wavg(g, col))
+           .reset_index(name="ESG"))
+    return px.line(d, x="refdate", y="ESG",
+                   title="Portfolio ESG (Weighted Avg)", color_discrete_sequence=ninetyone_colors)
+
+# 2) Portfolio E/S/G through time
+def fig_portfolio_esg_pillars(df,
+    cols=("Overall ESG Environmental Score","Overall ESG Social Score","Overall ESG Governance Score")):
+    df = _prep(df)
+    out = []
+    for c in cols:
+        out.append(df.groupby("refdate").apply(lambda g: _wavg(g, c)).rename(c))
+    d = pd.concat(out, axis=1).reset_index()
+    d = d.melt("refdate", var_name="Pillar", value_name="Score")
+    return px.line(d, x="refdate", y="Score", color="Pillar",
+                   title="Portfolio E / S / G (Weighted Avgs)", color_discrete_sequence=ninetyone_colors)
+
+# 3) Sector average ESG through time
+def fig_sector_esg(df, esg_col="Overall ESG Score", sector_col="GICS_sector"):
+    df = _prep(df).dropna(subset=[sector_col])
+    d = (df.groupby(["refdate", sector_col])
+           .apply(lambda g: _wavg(g, esg_col))
+           .reset_index(name="ESG"))
+    return px.line(d, x="refdate", y="ESG", color=sector_col,
+                   title="Sector ESG (Weighted Avg) Over Time", color_discrete_sequence=ninetyone_colors)
