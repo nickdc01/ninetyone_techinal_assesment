@@ -776,7 +776,6 @@ def _wavg(g, col):
         return np.nan               # <- key fix: skip groups with zero total weight
     return np.average(a, weights=w)
 
-# 1) Portfolio total ESG through time
 def fig_portfolio_esg(df, col="Overall ESG Score"):
     df = _prep(df)
     d = (df.groupby("refdate")
@@ -785,7 +784,6 @@ def fig_portfolio_esg(df, col="Overall ESG Score"):
     return px.line(d, x="refdate", y="ESG",
                    title="Portfolio ESG (Weighted Avg)", color_discrete_sequence=ninetyone_colors)
 
-# 2) Portfolio E/S/G through time
 def fig_portfolio_esg_pillars(df,
     cols=("Overall ESG Environmental Score","Overall ESG Social Score","Overall ESG Governance Score")):
     df = _prep(df)
@@ -797,11 +795,62 @@ def fig_portfolio_esg_pillars(df,
     return px.line(d, x="refdate", y="Score", color="Pillar",
                    title="Portfolio E / S / G (Weighted Avgs)", color_discrete_sequence=ninetyone_colors)
 
-# 3) Sector average ESG through time
 def fig_sector_esg(df, esg_col="Overall ESG Score", sector_col="GICS_sector"):
-    df = _prep(df).dropna(subset=[sector_col])
+    df = _prep(df)
+
+    # drop sectors that are NaN, blank, or text variants of null
+    bad_vals = ["", "na", "n/a", "null", "none", "nan"]
+    df = df.dropna(subset=[sector_col])
+    df = df[~df[sector_col].astype(str).str.strip().str.lower().isin(bad_vals)]
+
+    # compute weighted averages safely
     d = (df.groupby(["refdate", sector_col])
            .apply(lambda g: _wavg(g, esg_col))
            .reset_index(name="ESG"))
-    return px.line(d, x="refdate", y="ESG", color=sector_col,
-                   title="Sector ESG (Weighted Avg) Over Time", color_discrete_sequence=ninetyone_colors)
+
+    return px.line(
+        d,
+        x="refdate",
+        y="ESG",
+        color=sector_col,
+        title="Sector ESG (Weighted Avg) Over Time",
+        color_discrete_sequence=ninetyone_colors
+    )
+
+def fig_portfolio_esg_pillars_sector(
+    df,
+    sector="Materials",
+    cols=("Overall ESG Environmental Score","Overall ESG Social Score","Overall ESG Governance Score"),
+    sector_col="GICS_sector"
+):
+    df = _prep(df)
+
+    # drop sectors that are NaN, blank, or text variants of null
+    bad_vals = ["", "na", "n/a", "null", "none", "nan"]
+    df = df.dropna(subset=[sector_col])
+    df = df[~df[sector_col].astype(str).str.strip().str.lower().isin(bad_vals)]
+
+    # allow sector to be a single string or a list/tuple
+    if isinstance(sector, (list, tuple, set)):
+        wanted = {str(s).strip().lower() for s in sector}
+        df = df[df[sector_col].astype(str).str.strip().str.lower().isin(wanted)]
+        title_suffix = ", ".join(sorted(wanted))
+    else:
+        wanted = str(sector).strip().lower()
+        df = df[df[sector_col].astype(str).str.strip().str.lower() == wanted]
+        title_suffix = sector
+
+    # compute weighted averages per date for E/S/G
+    out = []
+    for c in cols:
+        s = (df.groupby("refdate").apply(lambda g: _wavg(g, c))).rename(c)
+        out.append(s)
+
+    d = pd.concat(out, axis=1).reset_index()
+    d = d.melt("refdate", var_name="Pillar", value_name="Score")
+
+    return px.line(
+        d, x="refdate", y="Score", color="Pillar",
+        title=f"Portfolio E / S / G (Weighted Avgs) — {title_suffix}",
+        color_discrete_sequence=ninetyone_colors
+    )
