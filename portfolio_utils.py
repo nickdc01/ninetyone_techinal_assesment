@@ -212,8 +212,10 @@ def sector_risk_contrib(df, sector_col="GICS_sector",
                         contrib_col="%Contribution to Total Risk",
                         date_col="refdate"):
     dt  = pd.to_datetime(df[date_col]).max()
-    day = df[df[date_col] == dt].dropna(subset=[sector_col]).copy()
-    day["ctr_pct"] = day[contrib_col]*100
+    bad_vals = ["", "na", "n/a", "null", "none", "nan"]
+    day = df.dropna(subset=[sector_col])
+    day = day[~day[sector_col].astype(str).str.strip().str.lower().isin(bad_vals)]
+    day["ctr_pct"] = day[contrib_col]
 
     d = (day.groupby(sector_col, as_index=False)["ctr_pct"]
             .sum()
@@ -821,7 +823,8 @@ def fig_portfolio_esg_pillars_sector(
     df,
     sector="Materials",
     cols=("Overall ESG Environmental Score","Overall ESG Social Score","Overall ESG Governance Score"),
-    sector_col="GICS_sector"
+    sector_col="GICS_sector",
+    weighted=False  # <- equal-weighted by default
 ):
     df = _prep(df)
 
@@ -830,7 +833,7 @@ def fig_portfolio_esg_pillars_sector(
     df = df.dropna(subset=[sector_col])
     df = df[~df[sector_col].astype(str).str.strip().str.lower().isin(bad_vals)]
 
-    # allow sector to be a single string or a list/tuple
+    # filter to one or many sectors
     if isinstance(sector, (list, tuple, set)):
         wanted = {str(s).strip().lower() for s in sector}
         df = df[df[sector_col].astype(str).str.strip().str.lower().isin(wanted)]
@@ -840,10 +843,16 @@ def fig_portfolio_esg_pillars_sector(
         df = df[df[sector_col].astype(str).str.strip().str.lower() == wanted]
         title_suffix = sector
 
-    # compute weighted averages per date for E/S/G
+    # choose aggregator per pillar
+    def _agg(g, col):
+        if weighted:
+            return _wavg(g, col)
+        # equal-weighted mean across holdings in this sector on that date
+        return g[col].mean(skipna=True)
+
     out = []
     for c in cols:
-        s = (df.groupby("refdate").apply(lambda g: _wavg(g, c))).rename(c)
+        s = (df.groupby("refdate").apply(lambda g, col=c: _agg(g, col))).rename(c)
         out.append(s)
 
     d = pd.concat(out, axis=1).reset_index()
@@ -851,6 +860,6 @@ def fig_portfolio_esg_pillars_sector(
 
     return px.line(
         d, x="refdate", y="Score", color="Pillar",
-        title=f"Portfolio E / S / G (Weighted Avgs) — {title_suffix}",
+        title=f"Portfolio E / S / G ({'Weighted' if weighted else 'Equal-Weighted'} Avgs) — {title_suffix}",
         color_discrete_sequence=ninetyone_colors
     )
